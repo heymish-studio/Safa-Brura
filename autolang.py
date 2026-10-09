@@ -36,7 +36,8 @@ DEFAULT_CONFIG = {
     "min_target_count": 200,
     "min_short_count": 5000,
     "beep_on_fix": True,
-    "hotkey": "pause",
+    "hotkeys": ["shift+backspace", "pause"],                 # convert the last word / undo an auto-fix
+    "hotkeys_all": ["ctrl+shift+backspace", "shift+pause"],   # convert everything since the last reset
     "fallback_switch_hotkey": "alt+shift",
     "excluded_processes": [
         "keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe", "mstsc.exe",
@@ -142,7 +143,8 @@ class AutoLanguage:
         self.last_fix = None      # info about the last automatic fix, for undo
         self.fixing = False
         self.pending = []         # real key events received while a fix is in progress
-        self.hotkey_mods, self.hotkey_vk = parse_hotkey(self.cfg.get("hotkey", "pause"))
+        self.hotkeys = [parse_hotkey(h) for h in self.cfg.get("hotkeys", []) + ([self.cfg["hotkey"]] if self.cfg.get("hotkey") else [])]
+        self.hotkeys_all = [parse_hotkey(h) for h in self.cfg.get("hotkeys_all", [])]
         self.hook_thread_id = None
         self.kb_hook = self.mouse_hook = None
         self._kb_proc = self._mouse_proc = None
@@ -164,7 +166,7 @@ class AutoLanguage:
         self.mouse_hook = W.user32.SetWindowsHookExW(W.WH_MOUSE_LL, self._mouse_proc, None, 0)
         if not self.kb_hook:
             log.error("keyboard hook failed: %s", ctypes.GetLastError())
-        log.info("hooks installed; hotkey=%s", self.cfg.get("hotkey"))
+        log.info("hooks installed; hotkeys=%s all=%s", self.cfg.get("hotkeys"), self.cfg.get("hotkeys_all"))
         W.message_loop()
         if self.kb_hook:
             W.user32.UnhookWindowsHookEx(self.kb_hook)
@@ -211,9 +213,12 @@ class AutoLanguage:
             return False
 
         mods = modifiers_down()
-        if self.hotkey_vk and vk == self.hotkey_vk and (mods == self.hotkey_mods or mods == self.hotkey_mods | {"shift"}):
-            self.manual_convert(everything="shift" in (mods - self.hotkey_mods))
-            return True
+        for hmods, hvk in self.hotkeys_all:
+            if hvk and vk == hvk and mods == hmods and self.manual_convert(everything=True):
+                return True
+        for hmods, hvk in self.hotkeys:
+            if hvk and vk == hvk and mods == hmods and self.manual_convert(everything=False):
+                return True  # nothing to convert -> the key keeps its normal meaning (e.g. Shift+Backspace deletes)
         if mods & {"ctrl", "alt", "win"}:
             self.reset("shortcut")
             return False
@@ -289,25 +294,27 @@ class AutoLanguage:
 
     def manual_convert(self, everything=False):
         """Hotkey: convert the last word (Shift: everything since the last reset) to the other
-        layout. Right after an automatic fix it undoes that fix and remembers the word."""
+        layout. Right after an automatic fix it undoes that fix and remembers the word.
+        Returns True when a conversion was started."""
         if not self.keys:
-            return
+            return False
         cur = self.engine.by_id.get(self.layout_id)
         if cur is None:
-            return
+            return False
         undo = self.last_fix is not None and not everything
         start = 0 if everything else (self.last_fix["start"] if undo else self.last_word_start())
         keys = self.keys[start:]
         if not keys:
-            return
+            return False
         target = self.engine.other_language(cur, keys)
         if target is None:
-            return
+            return False
         if undo and self.last_fix.get("source_text"):
             self.remember_ignore(self.last_fix["source_text"], self.last_fix["text"])
         self.fixing = True
         self.pending = []
         self.jobs.put(("manual", dict(keys=keys, cur=cur, target=target, undo=undo)))
+        return True
 
     def remember_ignore(self, *words):
         with self.lock:
@@ -488,11 +495,13 @@ class AutoLanguage:
                 W.user32.PostThreadMessageW(self.hook_thread_id, W.WM_QUIT, 0, 0)
             icon.stop()
 
-        hot = self.cfg.get("hotkey", "pause")
+        hot = " / ".join(self.cfg.get("hotkeys", []))
+        hot_all = " / ".join(self.cfg.get("hotkeys_all", []))
         menu = pystray.Menu(
             Item(f"{NAME_HE} · {NAME_EN}", None, enabled=False),
             Item("תיקון אוטומטי פעיל", toggle_enabled, checked=lambda item: self.cfg["enabled"]),
-            Item(f"{hot} = המרת המילה האחרונה / ביטול תיקון,  Shift+{hot} = הכול", None, enabled=False),
+            Item(f"המרת המילה האחרונה / ביטול: {hot}", None, enabled=False),
+            Item(f"המרת הכול: {hot_all}", None, enabled=False),
             Item("הפעלה עם ווינדוס", toggle_startup, checked=lambda item: startup_enabled()),
             Item("הסבר קצר", show_help),
             Item("דף התוכנה באינטרנט", open_site),
@@ -507,18 +516,43 @@ class AutoLanguage:
 # --------------------------------------------------------- welcome window -
 WELCOME_TEXT = """התוכנה רצה ברקע ומתקנת מילים שהקלדת בשפה הלא נכונה.
 
-•  הקלדת "akuo" ורווח כשהמקלדת באנגלית?  יהפוך ל"שלום" והמקלדת תעבור לעברית.
-•  הקלדת "יקךךם" ורווח כשהמקלדת בעברית?  יהפוך ל"hello" והמקלדת תעבור לאנגלית.
-•  מקש Pause ממיר ידנית את המילה האחרונה. מיד אחרי תיקון אוטומטי הוא מבטל אותו.
-•  Shift+Pause ממיר את כל מה שהקלדת מאז הלחיצה האחרונה.
+•  הקלדת "akuo" ורווח כשהמקלדת באנגלית? יהפוך ל"שלום" והמקלדת תעבור לעברית.
+•  הקלדת "יקךךם" ורווח כשהמקלדת בעברית? יהפוך ל"hello" והמקלדת תעבור לאנגלית.
+•  Shift+Backspace (או Pause) ממיר ידנית את המילה האחרונה. מיד אחרי תיקון אוטומטי זה מבטל אותו.
+•  Ctrl+Shift+Backspace (או Shift+Pause) ממיר את כל מה שהקלדת מאז הלחיצה האחרונה.
 •  בשדות סיסמה ובטרמינלים התוכנה לא נוגעת.
 
-האייקון הכחול Aא נמצא במגש המערכת, לפעמים מאחורי החץ ^ ליד השעון.
-לחיצה ימנית עליו: כיבוי והדלקה, הגדרות, יציאה."""
+האייקון הכחול Aא נמצא במגש המערכת, לפעמים מאחורי החץ ^ ליד השעון. לחיצה ימנית עליו: כיבוי והדלקה, הגדרות, יציאה."""
 
 
 def show_welcome(app, auto_close_ms=None):
-    """First-run explanation window (Hebrew, right-to-left). Runs in its own thread."""
+    """First-run explanation (Hebrew). Native Windows task dialog, which lays out bidirectional
+    text correctly; the Tk window below is only a fallback. Runs in its own thread."""
+    try:
+        from welcome import show_task_dialog
+        import webbrowser
+        result = show_task_dialog(
+            f"{NAME_HE} · {NAME_EN}", f"ברוכים הבאים ל{NAME_HE}", WELCOME_TEXT, [(100, "הבנתי, התחל")],
+            footer=f'<a href="{GITHUB_URL}">הסבר מלא באינטרנט</a>',
+            verify_text="הפעל אוטומטית בכל כניסה לווינדוס", verify_checked=startup_enabled() or not app.cfg.get("welcomed"),
+            on_hyperlink=lambda href: webbrowser.open(href), auto_close_ms=auto_close_ms)
+    except Exception:
+        log.exception("native welcome dialog")
+        result = None
+    if result is not None:
+        _, checked = result
+        try:
+            set_startup(checked)
+        except Exception:
+            log.exception("startup shortcut")
+        with app.lock:
+            app.cfg["welcomed"] = True
+            save_config(app.cfg)
+        return
+    show_welcome_tk(app, auto_close_ms)
+
+
+def show_welcome_tk(app, auto_close_ms=None):
     import tkinter as tk
     from tkinter import ttk
     root = tk.Tk()
