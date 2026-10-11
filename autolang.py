@@ -27,7 +27,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "log.txt")
 REPLAY_TAG = 0xA7101A97
 GITHUB_URL = "https://github.com/heymish-studio/Safa-Brura"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ACCEPT_INJECTED = "--accept-injected" in sys.argv  # testing only: treat synthetic input as typed
 
 DEFAULT_CONFIG = {
@@ -262,7 +262,8 @@ class AutoLanguage:
             log.info("auto-fix %r -> %r (%s)", decision.source_text, decision.text, decision.target.tag)
             self.fixing = True
             self.pending = []
-            self.jobs.put(("fix", dict(word=list(word), decision=decision, boundary=(vk, scan, rec), cur=cur)))
+            self.jobs.put(("fix", dict(word=list(word), start=self.word_start, decision=decision,
+                                       boundary=(vk, scan, rec), cur=cur)))
             return True
 
         if vk in LINE_VKS:
@@ -395,8 +396,14 @@ class AutoLanguage:
             self._after_boundary(bvk, brec, cur)
             return
         target = decision.target
-        W.send_backspaces(len(decision.source_text))
-        W.send_text(decision.text)
+        # One sentence, one language: the fixed word proves which language the user is writing in, so
+        # everything typed since the start of the sentence moves to that language too (short words like
+        # "to" = אם are real words in both languages and never trigger a fix on their own).
+        span_start, prefix_old, prefix_new, converted = self._sentence_prefix(job["start"], cur, target)
+        if converted:
+            log.info("sentence %r -> %r", prefix_old, prefix_new)
+        W.send_backspaces(len(prefix_old) + len(decision.source_text))
+        W.send_text(prefix_new + decision.text)
         self._switch_layout(target)
         if bvk in LINE_VKS or bvk == W.VK_SPACE:
             W.send_vk(bvk, bscan)
@@ -404,11 +411,68 @@ class AutoLanguage:
             W.send_text(target.render([brec]) or cur.render([brec]))
         if self.cfg.get("beep_on_fix"):
             W.beep()
-        for k in word:
+        for k in word + converted:
             k.layout = target.id
             k.fixed = True
-        self.last_fix = dict(source_text=decision.source_text, text=decision.text, start=len(self.keys) - len(word))
+        self.last_fix = dict(source_text=decision.source_text, text=decision.text,
+                             start=span_start if converted else job["start"])
         self._after_boundary(bvk, brec, target)
+
+    def _sentence_prefix(self, word_start, cur, target):
+        """Words typed before the fixed word in the same sentence, re-rendered in the target language.
+
+        Goes back from the fixed word to the start of the buffer (start of typing in this field) or to
+        the last sentence end ('.', '!', '?' as it actually appeared on screen). A word is converted
+        unless it was already fixed, is on the ignore list, or would not be a well-formed word in the
+        target language (e.g. 'ok' -> 'םל'). Returns (span_start, old_text, new_text, converted_keys).
+        """
+        def lang_of(k):
+            return self.engine.by_id.get(k.layout, cur)
+
+        start = word_start
+        while start > 0:
+            k = self.keys[start - 1]
+            if lang_of(k).render([k]) in (".", "!", "?"):
+                break
+            start -= 1
+        prefix = self.keys[start:word_start]
+        if not prefix:
+            return word_start, "", "", []
+
+        # split the prefix into words (letter keys) and separators (spaces, digits, punctuation)
+        groups, buf = [], []
+        for k in prefix:
+            is_word = self.engine.is_word_key(k, lang_of(k)) and not lang_of(k).render([k]).isdigit()
+            if is_word:
+                buf.append(k)
+            else:
+                if buf:
+                    groups.append(("w", buf))
+                    buf = []
+                groups.append(("s", [k]))
+        if buf:
+            groups.append(("w", buf))
+
+        old_parts, new_parts, converted = [], [], []
+        for kind, keys in groups:
+            old = "".join(lang_of(k).render([k]) for k in keys)
+            new = old
+            if kind == "w" and not any(k.fixed for k in keys) and all(lang_of(k) is not target for k in keys):
+                candidate = target.render(keys)
+                if (target.well_formed(candidate) and old.lower() not in self.engine.ignore_words
+                        and candidate.lower() not in self.engine.ignore_words):
+                    new = candidate
+                    converted.extend(keys)
+            old_parts.append(old)
+            new_parts.append(new)
+        if not converted:
+            return word_start, "", "", []
+        # retype from the first changed character only, to keep the backspace run short
+        old_text, new_text = "".join(old_parts), "".join(new_parts)
+        i = 0
+        while i < min(len(old_text), len(new_text)) and old_text[i] == new_text[i]:
+            i += 1
+        return start, old_text[i:], new_text[i:], converted
 
     def _after_boundary(self, bvk, brec, lang):
         if bvk in LINE_VKS:
