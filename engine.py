@@ -152,6 +152,8 @@ class Engine:
         """keys: list[KeyRec] of the current word; cur: Language they were typed in."""
         if cur is None or len(keys) < self.min_word_len:
             return None
+        if not cur.freq:
+            return None  # word list missing (broken install): never guess
         source = cur.render(keys)
         if not source or any(c.isdigit() for c in source):
             return None
@@ -161,6 +163,8 @@ class Engine:
             return None
         for lang in self.languages:
             if lang is cur:
+                continue
+            if not lang.freq:
                 continue
             text = lang.render(keys)
             if text.lower() in self.ignore_words:

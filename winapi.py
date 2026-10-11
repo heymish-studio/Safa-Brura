@@ -214,14 +214,28 @@ def send_backspaces(n):
     send_inputs(inputs)
 
 
-def send_text(text):
+def _text_inputs(text):
     inputs = []
     for ch in text:
-        raw = ch.encode("utf-16-le")
-        for i in range(0, len(raw), 2):
-            cu = int.from_bytes(raw[i:i + 2], "little")
+        cp = ord(ch)
+        units = [cp] if cp < 0x10000 else [0xD800 + ((cp - 0x10000) >> 10), 0xDC00 + ((cp - 0x10000) & 0x3FF)]
+        for cu in units:
             inputs.append(_key_input(0, cu, KEYEVENTF_UNICODE))
             inputs.append(_key_input(0, cu, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    return inputs
+
+
+def send_text(text):
+    send_inputs(_text_inputs(text))
+
+
+def replace_text(n_backspaces, text):
+    """Delete n characters and type `text` in a single SendInput call (all inputs built up front)."""
+    inputs = []
+    for _ in range(n_backspaces):
+        inputs.append(_key_input(VK_BACK, 0, 0))
+        inputs.append(_key_input(VK_BACK, 0, KEYEVENTF_KEYUP))
+    inputs.extend(_text_inputs(text))
     send_inputs(inputs)
 
 

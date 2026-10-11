@@ -27,7 +27,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "log.txt")
 REPLAY_TAG = 0xA7101A97
 GITHUB_URL = "https://github.com/heymish-studio/Safa-Brura"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ACCEPT_INJECTED = "--accept-injected" in sys.argv  # testing only: treat synthetic input as typed
 
 DEFAULT_CONFIG = {
@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     ],
     "excluded_window_classes": ["ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"],
     "ignore_words": [],
+    "check_updates": True,
+    "notified_version": "",
 }
 
 VK_NAMES = {
@@ -149,6 +151,7 @@ class AutoLanguage:
         self.kb_hook = self.mouse_hook = None
         self._kb_proc = self._mouse_proc = None
         self.icon = None
+        self.update_info = None   # set when GitHub has a newer release
 
     # ------------------------------------------------------------ setup --
     def init_engine(self):
@@ -402,8 +405,7 @@ class AutoLanguage:
         span_start, prefix_old, prefix_new, converted = self._sentence_prefix(job["start"], cur, target)
         if converted:
             log.info("sentence %r -> %r", prefix_old, prefix_new)
-        W.send_backspaces(len(prefix_old) + len(decision.source_text))
-        W.send_text(prefix_new + decision.text)
+        W.replace_text(len(prefix_old) + len(decision.source_text), prefix_new + decision.text)
         self._switch_layout(target)
         if bvk in LINE_VKS or bvk == W.VK_SPACE:
             W.send_vk(bvk, bscan)
@@ -423,8 +425,11 @@ class AutoLanguage:
 
         Goes back from the fixed word to the start of the buffer (start of typing in this field) or to
         the last sentence end ('.', '!', '?' as it actually appeared on screen). A word is converted
-        unless it was already fixed, is on the ignore list, or would not be a well-formed word in the
-        target language (e.g. 'ok' -> 'םל'). Returns (span_start, old_text, new_text, converted_keys).
+        only if it is a real word in the target language ('to' -> 'אם'); 'ok' -> 'םל' stays.
+        Safety: if any earlier word is a real word as typed but NOT in the target language
+        ('אני' -> 'tbh'), the sentence really is in the current language and the prefix is left alone,
+        so one wrong fix can never turn a whole correct sentence into gibberish.
+        Returns (span_start, old_text, new_text, converted_keys).
         """
         def lang_of(k):
             return self.engine.by_id.get(k.layout, cur)
@@ -459,10 +464,14 @@ class AutoLanguage:
             new = old
             if kind == "w" and not any(k.fixed for k in keys) and all(lang_of(k) is not target for k in keys):
                 candidate = target.render(keys)
-                if (target.well_formed(candidate) and old.lower() not in self.engine.ignore_words
-                        and candidate.lower() not in self.engine.ignore_words):
+                if old.lower() in self.engine.ignore_words or candidate.lower() in self.engine.ignore_words:
+                    pass
+                elif target.plausible(candidate):
                     new = candidate
                     converted.extend(keys)
+                elif lang_of(keys[0]).plausible(old):
+                    log.info("sentence left alone: %r is a real word as typed", old)
+                    return word_start, "", "", []
             old_parts.append(old)
             new_parts.append(new)
         if not converted:
@@ -498,8 +507,7 @@ class AutoLanguage:
         # (unless this is an undo of that very fix)
         new_text = "".join(target.render([k]) if flips(k) else lang_of(k).render([k]) for k in keys)
         log.info("manual %r -> %r", old_text, new_text)
-        W.send_backspaces(len(old_text))
-        W.send_text(new_text)
+        W.replace_text(len(old_text), new_text)
         self._switch_layout(target)
         for k in keys:
             if flips(k):
@@ -524,6 +532,95 @@ class AutoLanguage:
         d.text((9, 12), "A", font=font, fill="white")
         d.text((33, 12), "\u05d0", font=font, fill="white")
         return img
+
+    # --------------------------------------------------------- updates ----
+    def notify(self, message):
+        try:
+            if self.icon is not None:
+                self.icon.notify(message, f"{NAME_HE} · {NAME_EN}")
+        except Exception:
+            log.exception("notify")
+
+    def check_updates(self, manual=False):
+        import updater
+        try:
+            info = updater.check_latest(VERSION)
+        except Exception as e:
+            log.info("update check failed: %s", e)
+            if manual:
+                self.notify("לא הצלחתי לבדוק עדכונים. בדקו את החיבור לאינטרנט.")
+            return
+        self.update_info = info
+        if self.icon is not None:
+            self.icon.update_menu()
+        if info is None:
+            log.info("up to date (%s)", VERSION)
+            if manual:
+                self.notify(f"יש לכם את הגרסה האחרונה ({VERSION}).")
+            return
+        log.info("update available: %s", info["version"])
+        if manual or self.cfg.get("notified_version") != info["version"]:
+            self.notify(f"גרסה {info['version']} זמינה. לעדכון: לחיצה ימנית על האייקון, ואז \"עדכון\".")
+            with self.lock:
+                self.cfg["notified_version"] = info["version"]
+                save_config(self.cfg)
+
+    def run_update_checker(self):
+        time.sleep(20)  # let the tray icon appear first
+        while True:
+            if self.cfg.get("check_updates", True):
+                self.check_updates()
+            time.sleep(24 * 3600)
+
+    def start_update(self):
+        """Ask, then download and swap the exe. Runs on its own thread."""
+        import updater
+        import webbrowser
+        info = self.update_info
+        if not info:
+            return
+        if "--update-now" not in sys.argv:
+            from welcome import show_task_dialog
+            body = (info.get("notes") or "") + "\n\nהעדכון לוקח כמה שניות. התוכנה תיסגר ותיפתח מחדש לבד."
+            result = show_task_dialog(f"{NAME_HE} · {NAME_EN}", f"גרסה {info['version']} זמינה",
+                                      body.strip(), [(101, "עדכנו עכשיו"), (102, "אחר כך")],
+                                      footer=f'<a href="{info["page"]}">מה השתנה, בפירוט</a>',
+                                      on_hyperlink=lambda href: webbrowser.open(href))
+            if result is None or result[0] != 101:
+                return
+        if not updater.can_self_update():
+            webbrowser.open(info["page"])
+            return
+        try:
+            log.info("installing %s", info["version"])
+            updater.install(info)
+        except Exception as e:
+            log.exception("update failed")
+            self.notify(f"העדכון נכשל ({e}). אפשר להוריד את הגרסה החדשה מהאתר.")
+            webbrowser.open(info["page"])
+            return
+        self.shutdown()
+        os._exit(0)
+
+    def shutdown(self):
+        self.jobs.put(("quit", None))
+        if self.hook_thread_id:
+            W.user32.PostThreadMessageW(self.hook_thread_id, W.WM_QUIT, 0, 0)
+        release_single_instance()
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+
+    def _update_now(self):
+        """Testing aid (--update-now): check and install without asking."""
+        time.sleep(3)
+        self.check_updates()
+        if self.update_info:
+            self.start_update()
+        else:
+            log.info("--update-now: nothing newer than %s", VERSION)
 
     def run_tray(self):
         import pystray
@@ -554,27 +651,42 @@ class AutoLanguage:
             webbrowser.open(GITHUB_URL)
 
         def quit_app(icon, item):
-            self.jobs.put(("quit", None))
-            if self.hook_thread_id:
-                W.user32.PostThreadMessageW(self.hook_thread_id, W.WM_QUIT, 0, 0)
-            icon.stop()
+            self.shutdown()
+
+        def do_update(icon, item):
+            threading.Thread(target=self.start_update, daemon=True).start()
+
+        def manual_check(icon, item):
+            threading.Thread(target=self.check_updates, kwargs={"manual": True}, daemon=True).start()
+
+        def on_ready(icon):
+            icon.visible = True
+            if "--after-update" in sys.argv:
+                self.notify(f"עודכן לגרסה {VERSION}. אפשר להמשיך להקליד.")
+            if "--update-now" in sys.argv:
+                threading.Thread(target=self._update_now, daemon=True).start()
+            else:
+                threading.Thread(target=self.run_update_checker, daemon=True).start()
 
         hot = " / ".join(self.cfg.get("hotkeys", []))
         hot_all = " / ".join(self.cfg.get("hotkeys_all", []))
         menu = pystray.Menu(
-            Item(f"{NAME_HE} · {NAME_EN}", None, enabled=False),
+            Item(f"{NAME_HE} · {NAME_EN}  {VERSION}", None, enabled=False),
+            Item(lambda item: f"עדכון לגרסה {self.update_info['version']} זמין, לחצו לעדכון" if self.update_info else "",
+                 do_update, visible=lambda item: self.update_info is not None),
             Item("תיקון אוטומטי פעיל", toggle_enabled, checked=lambda item: self.cfg["enabled"]),
             Item(f"המרת המילה האחרונה / ביטול: {hot}", None, enabled=False),
             Item(f"המרת הכול: {hot_all}", None, enabled=False),
             Item("הפעלה עם ווינדוס", toggle_startup, checked=lambda item: startup_enabled()),
             Item("הסבר קצר", show_help),
+            Item("בדיקת עדכונים", manual_check),
             Item("דף התוכנה באינטרנט", open_site),
             Item("פתח קובץ הגדרות", open_config),
             Item("פתח יומן", open_log),
             Item("יציאה", quit_app),
         )
         self.icon = pystray.Icon(APP_NAME, self.make_icon_image(), f"{NAME_HE} · {NAME_EN}", menu)
-        self.icon.run()
+        self.icon.run(setup=on_ready)
 
 
 # --------------------------------------------------------- welcome window -
@@ -696,9 +808,30 @@ def set_startup(enable):
                    creationflags=0x08000000, check=False)  # CREATE_NO_WINDOW
 
 
-def single_instance():
-    W.kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME}.SingleInstance")
-    return W.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+_mutex = None
+
+
+def single_instance(wait_seconds=0):
+    """Own the app-wide mutex. After an update the old instance may still be exiting, so retry."""
+    global _mutex
+    W.kernel32.CreateMutexW.restype = ctypes.c_void_p
+    deadline = time.time() + wait_seconds
+    while True:
+        h = W.kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME}.SingleInstance")
+        if W.kernel32.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
+            _mutex = h
+            return True
+        W.kernel32.CloseHandle(ctypes.c_void_p(h))
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def release_single_instance():
+    global _mutex
+    if _mutex:
+        W.kernel32.CloseHandle(ctypes.c_void_p(_mutex))
+        _mutex = None
 
 
 def setup_logging():
@@ -717,6 +850,7 @@ def setup_logging():
 
 
 def main():
+    global VERSION
     setup_logging()
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp welcome window on high-DPI screens
@@ -725,15 +859,25 @@ def main():
     if "--welcome-test" in sys.argv:
         show_welcome(AutoLanguage(), auto_close_ms=2500)
         return
-    if not single_instance():
+    for arg in sys.argv:
+        if arg.startswith("--pretend-version="):  # testing aid for the updater
+            VERSION = arg.split("=", 1)[1]
+    if not single_instance(wait_seconds=15 if "--after-update" in sys.argv else 0):
         log.info("already running")
         return
+    log.info("Safa Brura %s starting", VERSION)
+    if "--after-update" in sys.argv:
+        import updater
+        threading.Thread(target=updater.cleanup_old, daemon=True).start()
     app = AutoLanguage()
     if "--install-startup" in sys.argv:
         set_startup(True)
     if not app.cfg.get("welcomed") and "--no-tray" not in sys.argv:
         threading.Thread(target=show_welcome, args=(app,), daemon=True).start()
-    threading.Thread(target=app.run_hooks, name="hooks", daemon=True).start()
+    if "--no-hooks" not in sys.argv:  # testing aid: update tests must not touch the keyboard
+        threading.Thread(target=app.run_hooks, name="hooks", daemon=True).start()
+    else:
+        app.init_engine()
     threading.Thread(target=app.run_worker, name="worker", daemon=True).start()
     if "--no-tray" in sys.argv:
         try:

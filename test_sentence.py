@@ -45,6 +45,7 @@ def send_vk(vk, scan=0):
 
 
 W.send_backspaces = send_backspaces
+W.replace_text = lambda n, t: (send_backspaces(n), send_text(t))
 W.send_text = send_text
 W.send_vk = send_vk
 W.send_inputs = lambda inputs: None
@@ -151,5 +152,22 @@ check("Shift+Backspace undoes the whole sentence fix", "to t,v ", EN)
 
 reset(EN); type_keys("אם 3 אנשים ", HE)
 check("digits kept, sentence converted", "אם 3 אנשים ", HE)
+
+
+# --- safety: a wrong fix in the middle of a correct sentence must not rewrite the sentence --------
+def prefix_check(name, typed, typed_lang, target, want_converted):
+    reset(typed_lang)
+    type_keys(typed, typed_lang)
+    start, old, new, converted = app._sentence_prefix(len(app.keys), app.engine.by_id[typed_lang.id],
+                                                      app.engine.by_id[target.id])
+    ok = bool(converted) == want_converted
+    results.append(ok)
+    print(f"{'PASS' if ok else 'FAIL'} {name}: converted={bool(converted)} {old!r} -> {new!r}")
+
+
+prefix_check("the sentence from the incident stays Hebrew",
+             "אני כבר מצאתי אחד ויש גירסה מעודכנת באותו הלינק ", HE, EN, False)
+prefix_check("correct English sentence stays English", "I already found one and ", EN, HE, False)
+prefix_check("'to ' before a Hebrew word is converted", "to ", EN, HE, True)
 
 print(f"\n{sum(results)}/{len(results)} passed")
