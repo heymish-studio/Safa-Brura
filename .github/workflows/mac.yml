@@ -1,0 +1,32 @@
+name: Mac build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["mac-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build, test and package
+        run: bash mac/build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SafaBrura-mac
+          path: dist/SafaBrura-mac.zip
+      - name: Publish beta release (tag builds only, after the selftest passed)
+        if: startsWith(github.ref, 'refs/tags/mac-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/SafaBrura-mac.zip --prerelease \
+            --title "שפה ברורה למק ${GITHUB_REF_NAME#mac-v} (ניסיון)" --notes-file mac/RELEASE_NOTES.md
