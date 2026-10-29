@@ -27,8 +27,18 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "log.txt")
 REPLAY_TAG = 0xA7101A97
 GITHUB_URL = "https://github.com/heymish-studio/Safa-Brura"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 ACCEPT_INJECTED = "--accept-injected" in sys.argv  # testing only: treat synthetic input as typed
+INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA", APP_DIR), "Programs", APP_NAME)
+INSTALLED_EXE = os.path.join(INSTALL_DIR, f"{APP_NAME}.exe")
+UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall" + "\\" + APP_NAME
+QUIT_EVENT = f"Local\\{APP_NAME}.Quit"
+LANG_NAMES = {"he": "עברית", "en": "אנגלית", "ru": "רוסית", "ar": "ערבית", "fr": "צרפתית"}
+REVERSAL_WINDOW = 90      # seconds: a fix undone by the user's own typing within this window was wrong
+REJECT_WINDOW = 15        # seconds: the user switching the layout back right after a fix rejects it
+STRIKES_TO_PAUSE = 3      # wrong fixes within STRIKE_WINDOW pause automatic fixing...
+STRIKE_WINDOW = 600
+PAUSE_SECONDS = 600       # ...for this long
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -145,6 +155,10 @@ class AutoLanguage:
         self.last_fix = None      # info about the last automatic fix, for undo
         self.fixing = False
         self.pending = []         # real key events received while a fix is in progress
+        self.recent_fix = None    # last automatic fix, kept while the user keeps typing (ping-pong guard)
+        self.buffer_gen = 0       # bumped on every reset: tells whether recent_fix text is still reachable
+        self.strikes = []         # times of fixes that turned out wrong
+        self.paused_until = 0.0   # automatic fixing suspended until this time
         self.hotkeys = [parse_hotkey(h) for h in self.cfg.get("hotkeys", []) + ([self.cfg["hotkey"]] if self.cfg.get("hotkey") else [])]
         self.hotkeys_all = [parse_hotkey(h) for h in self.cfg.get("hotkeys_all", [])]
         self.hook_thread_id = None
@@ -186,6 +200,7 @@ class AutoLanguage:
         self.word_start = 0
         self.skip_until_reset = False
         self.last_fix = None
+        self.buffer_gen += 1
 
     def _keyboard_proc(self, code, wparam, lparam):
         if code < 0:
@@ -230,6 +245,14 @@ class AutoLanguage:
         hkl = W.current_layout()
         lid = W.layout_id(hkl)
         if hwnd != self.focus_hwnd or lid != self.layout_id:
+            rf = self.recent_fix
+            if (rf and hwnd == self.focus_hwnd and self.layout_id == rf["to_id"] and lid == rf["from_id"]
+                    and time.time() - rf["time"] < REJECT_WINDOW):
+                # the user switched the layout straight back by hand: our fix was unwanted
+                log.info("fix rejected by manual layout switch: %r -> %r", rf["source_text"], rf["text"])
+                self.recent_fix = None
+                self.remember_ignore(rf["source_text"], rf["text"])
+                self.strike()
             self.reset("focus/layout")
             self.focus_hwnd, self.layout_id = hwnd, lid
         cur = self.engine.language_for(hkl)
@@ -259,14 +282,27 @@ class AutoLanguage:
             return False  # non-character key (F-keys, media keys...): not part of the text
         word = self.keys[self.word_start:]
         decision = None
-        if self.cfg["enabled"] and word and not self.skip_until_reset:
+        if self.cfg["enabled"] and word and not self.skip_until_reset and time.time() >= self.paused_until:
             decision = self.engine.decide(word, cur)
+        reversal = None
+        rf = self.recent_fix
+        if rf and word:
+            if decision is None:
+                if cur.plausible(cur.render(word), morph=True):
+                    self.recent_fix = None  # a real word in the fixed language: the fix was right
+            elif (decision.target.id == rf["from_id"] and cur.id == rf["to_id"]
+                  and time.time() - rf["time"] < REVERSAL_WINDOW):
+                # the user went on typing in the language we switched away from: the earlier fix was
+                # wrong. Fix this word (it is in that language) and, if the earlier text is still in
+                # reach, restore it too.
+                reversal = rf
+                self.recent_fix = None
         if decision:
             log.info("auto-fix %r -> %r (%s)", decision.source_text, decision.text, decision.target.tag)
             self.fixing = True
             self.pending = []
             self.jobs.put(("fix", dict(word=list(word), start=self.word_start, decision=decision,
-                                       boundary=(vk, scan, rec), cur=cur)))
+                                       boundary=(vk, scan, rec), cur=cur, reversal=reversal)))
             return True
 
         if vk in LINE_VKS:
@@ -387,7 +423,10 @@ class AutoLanguage:
                     log.info("layout switch via message failed; sending %s", spec)
                     W.send_combo(vks)
                     time.sleep(0.08)
-        self.layout_id = target.id
+        actual = W.layout_id(W.current_layout())
+        if actual != target.id:
+            log.warning("layout switch to %s failed (active layout %04x)", target.tag, actual)
+        self.layout_id = actual
 
     def _do_fix(self, job):
         reason = self.excluded_here()
@@ -399,6 +438,14 @@ class AutoLanguage:
             self._after_boundary(bvk, brec, cur)
             return
         target = decision.target
+        rf = job.get("reversal")
+        if rf:
+            log.info("earlier fix %r -> %r was wrong (user kept typing %s)", rf["source_text"], rf["text"], target.tag)
+            self.remember_ignore(rf["source_text"], rf["text"])
+            self.strike()
+            if rf["gen"] == self.buffer_gen and rf["start"] < job["start"]:
+                self._repair(rf["start"], target, (bvk, bscan, brec))
+                return
         # One sentence, one language: the fixed word proves which language the user is writing in, so
         # everything typed since the start of the sentence moves to that language too (short words like
         # "to" = אם are real words in both languages and never trigger a fix on their own).
@@ -418,7 +465,56 @@ class AutoLanguage:
             k.fixed = True
         self.last_fix = dict(source_text=decision.source_text, text=decision.text,
                              start=span_start if converted else job["start"])
+        self.recent_fix = None if rf else dict(
+            time=time.time(), from_id=cur.id, to_id=target.id, start=span_start if converted else job["start"],
+            gen=self.buffer_gen, source_text=decision.source_text, text=decision.text)
         self._after_boundary(bvk, brec, target)
+
+    def _repair(self, start, lang, boundary):
+        """Everything from a wrong fix onwards was meant in `lang`: retype it that way in one go."""
+        bvk, bscan, brec = boundary
+        span = self.keys[start:]
+        old = "".join(self.engine.by_id.get(k.layout, lang).render([k]) for k in span)
+        new = lang.render(span)
+        log.info("repair %r -> %r", old, new)
+        W.replace_text(len(old), new)
+        self._switch_layout(lang)
+        if bvk in LINE_VKS or bvk == W.VK_SPACE:
+            W.send_vk(bvk, bscan)
+        else:
+            W.send_text(lang.render([brec]))
+        if self.cfg.get("beep_on_fix"):
+            W.beep()
+            W.beep()
+        for k in span:
+            k.layout = lang.id
+            k.fixed = True
+        self.last_fix = None
+        self.notify(f"תיקנתי בטעות ותיקנתי בחזרה ל{LANG_NAMES.get(lang.short, lang.tag)}. "
+                    f"המילה נוספה לרשימת ההחרגה ולא תתוקן שוב.")
+        self._after_boundary(bvk, brec, lang)
+
+    def strike(self):
+        """A fix turned out wrong. Too many of those in a short time: stop fixing for a while."""
+        now = time.time()
+        self.strikes = [t for t in self.strikes if now - t < STRIKE_WINDOW] + [now]
+        if len(self.strikes) >= STRIKES_TO_PAUSE and now >= self.paused_until:
+            self.paused_until = now + PAUSE_SECONDS
+            self.strikes = []
+            log.warning("too many wrong fixes: automatic fixing paused for %d s", PAUSE_SECONDS)
+            self.notify(f"יותר מדי תיקוני-שווא, התיקון האוטומטי מושהה ל-{PAUSE_SECONDS // 60} דקות. "
+                        "לכיבוי קבוע: לחיצה על האייקון ליד השעון.")
+            self.refresh_icon()
+            t = threading.Timer(PAUSE_SECONDS + 1, self.refresh_icon)
+            t.daemon = True
+            t.start()
+
+    def refresh_icon(self):
+        if self.icon is not None:
+            try:
+                self.icon.icon = self.make_icon_image()
+            except Exception:
+                pass
 
     def _sentence_prefix(self, word_start, cur, target):
         """Words typed before the fixed word in the same sentence, re-rendered in the target language.
@@ -523,7 +619,7 @@ class AutoLanguage:
         from PIL import Image, ImageDraw, ImageFont
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        on = self.cfg["enabled"]
+        on = self.cfg["enabled"] and time.time() >= self.paused_until
         d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(37, 99, 235, 255) if on else (120, 120, 120, 255))
         try:
             font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 30)
@@ -630,8 +726,14 @@ class AutoLanguage:
             with self.lock:
                 self.cfg["enabled"] = not self.cfg["enabled"]
                 save_config(self.cfg)
+            self.paused_until = 0.0
             icon.icon = self.make_icon_image()
             log.info("enabled=%s", self.cfg["enabled"])
+            self.notify("התיקון האוטומטי פועל." if self.cfg["enabled"] else
+                        "התיקון האוטומטי כבוי. המקשים הידניים עדיין עובדים. לחיצה נוספת על האייקון מדליקה.")
+
+        def do_uninstall(icon, item):
+            threading.Thread(target=uninstall, kwargs={"app": self}, daemon=True).start()
 
         def toggle_startup(icon, item):
             set_startup(not startup_enabled())
@@ -661,6 +763,7 @@ class AutoLanguage:
 
         def on_ready(icon):
             icon.visible = True
+            threading.Thread(target=wait_quit_event, args=(self,), daemon=True).start()
             if "--after-update" in sys.argv:
                 self.notify(f"עודכן לגרסה {VERSION}. אפשר להמשיך להקליד.")
             if "--update-now" in sys.argv:
@@ -674,7 +777,7 @@ class AutoLanguage:
             Item(f"{NAME_HE} · {NAME_EN}  {VERSION}", None, enabled=False),
             Item(lambda item: f"עדכון לגרסה {self.update_info['version']} זמין, לחצו לעדכון" if self.update_info else "",
                  do_update, visible=lambda item: self.update_info is not None),
-            Item("תיקון אוטומטי פעיל", toggle_enabled, checked=lambda item: self.cfg["enabled"]),
+            Item("תיקון אוטומטי פעיל", toggle_enabled, checked=lambda item: self.cfg["enabled"], default=True),
             Item(f"המרת המילה האחרונה / ביטול: {hot}", None, enabled=False),
             Item(f"המרת הכול: {hot_all}", None, enabled=False),
             Item("הפעלה עם ווינדוס", toggle_startup, checked=lambda item: startup_enabled()),
@@ -683,6 +786,7 @@ class AutoLanguage:
             Item("דף התוכנה באינטרנט", open_site),
             Item("פתח קובץ הגדרות", open_config),
             Item("פתח יומן", open_log),
+            Item("הסרת התוכנה מהמחשב...", do_uninstall),
             Item("יציאה", quit_app),
         )
         self.icon = pystray.Icon(APP_NAME, self.make_icon_image(), f"{NAME_HE} · {NAME_EN}", menu)
@@ -697,8 +801,10 @@ WELCOME_TEXT = """התוכנה רצה ברקע ומתקנת מילים שהקל�
 •  Shift+Backspace (או Pause) ממיר ידנית את המילה האחרונה. מיד אחרי תיקון אוטומטי זה מבטל אותו.
 •  Ctrl+Shift+Backspace (או Shift+Pause) ממיר את כל מה שהקלדת מאז הלחיצה האחרונה.
 •  בשדות סיסמה ובטרמינלים התוכנה לא נוגעת.
+•  טעתה? המשך להקליד כרגיל: היא תזהה את זה, תחזיר את הטקסט ותלמד. ואם היא טועה הרבה, היא עוצרת לבד.
 
-האייקון הכחול Aא נמצא במגש המערכת, לפעמים מאחורי החץ ^ ליד השעון. לחיצה ימנית עליו: כיבוי והדלקה, הגדרות, יציאה."""
+האייקון הכחול Aא נמצא במגש המערכת, לפעמים מאחורי החץ ^ ליד השעון. לחיצה אחת עליו מכבה ומדליקה את התיקון האוטומטי.
+לחיצה ימנית: הגדרות, הסרה מהמחשב, יציאה. אפשר להסיר גם דרך הגדרות ← אפליקציות."""
 
 
 def show_welcome(app, auto_close_ms=None):
@@ -792,7 +898,8 @@ def set_startup(enable):
             pass
         return
     if getattr(sys, "frozen", False):
-        target, args, workdir = sys.executable, "", os.path.dirname(sys.executable)
+        exe = INSTALLED_EXE if os.path.exists(INSTALLED_EXE) else sys.executable
+        target, args, workdir = exe, "", os.path.dirname(exe)
     else:
         pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
         target = pyw if os.path.exists(pyw) else sys.executable
@@ -806,6 +913,170 @@ def set_startup(enable):
     )
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                    creationflags=0x08000000, check=False)  # CREATE_NO_WINDOW
+
+
+# ------------------------------------------------- install / uninstall -
+def is_frozen():
+    return getattr(sys, "frozen", False)
+
+
+def same_file(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def register_uninstall(exe):
+    """List the app under Settings > Apps (per-user, no admin needed) so it can be removed like any program."""
+    import winreg
+    try:
+        size_kb = os.path.getsize(exe) // 1024
+    except OSError:
+        size_kb = 0
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as k:
+        for name, value in [
+            ("DisplayName", f"{NAME_HE} ({NAME_EN})"), ("DisplayVersion", VERSION), ("Publisher", "Heymish Studio"),
+            ("DisplayIcon", exe), ("InstallLocation", os.path.dirname(exe)),
+            ("UninstallString", f'"{exe}" --uninstall'), ("QuietUninstallString", f'"{exe}" --uninstall --quiet'),
+            ("URLInfoAbout", GITHUB_URL), ("HelpLink", GITHUB_URL), ("InstallDate", time.strftime("%Y%m%d")),
+        ]:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+        for name, value in [("NoModify", 1), ("NoRepair", 1), ("EstimatedSize", size_kb)]:
+            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, value)
+
+
+def unregister_uninstall():
+    import winreg
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+    except OSError:
+        pass
+
+
+def _quit_event():
+    W.kernel32.CreateEventW.restype = ctypes.c_void_p
+    W.kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+    return W.kernel32.CreateEventW(None, 0, 0, QUIT_EVENT)  # auto-reset
+
+
+def wait_quit_event(app):
+    """Running instance: another copy (installer or uninstaller) asks us to exit."""
+    h = _quit_event()
+    if not h:
+        return
+    W.kernel32.ResetEvent(ctypes.c_void_p(h))
+    W.kernel32.WaitForSingleObject(ctypes.c_void_p(h), 0xFFFFFFFF)
+    log.info("asked to quit by another instance")
+    app.shutdown()
+
+
+def stop_other_instances(wait_seconds=10):
+    """Ask the running instance to exit and wait until the single-instance mutex is free. Falls back
+    to killing older versions that do not understand the request. Returns True when the mutex is ours."""
+    h = _quit_event()
+    if h:
+        W.kernel32.SetEvent(ctypes.c_void_p(h))
+    if single_instance(wait_seconds=wait_seconds):
+        return True
+    import subprocess
+    me = os.getpid()
+    subprocess.run(["taskkill", "/F", "/FI", f"PID ne {me}", "/IM", f"{APP_NAME}.exe"],
+                   creationflags=0x08000000, capture_output=True)
+    return single_instance(wait_seconds=5)
+
+
+def install_self():
+    """A downloaded exe copies itself to the per-user Programs folder, registers for uninstall, points the
+    Startup shortcut there and starts the installed copy. Returns True when the caller must exit."""
+    if not is_frozen() or "--no-install" in sys.argv:
+        return False
+    exe = sys.executable
+    if same_file(exe, INSTALLED_EXE) or os.path.normcase(os.path.dirname(exe)) == os.path.normcase(INSTALL_DIR):
+        return False
+    import shutil
+    import updater
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        tmp = INSTALLED_EXE + ".download"
+        shutil.copyfile(exe, tmp)
+        if not stop_other_instances():
+            log.warning("install: another instance keeps running; staying in place")
+            os.remove(tmp)
+            return False
+        if os.path.exists(INSTALLED_EXE):
+            old = INSTALLED_EXE + updater.OLD_SUFFIX
+            if os.path.exists(old):
+                os.remove(old)
+            os.replace(INSTALLED_EXE, old)
+        os.replace(tmp, INSTALLED_EXE)
+        register_uninstall(INSTALLED_EXE)
+        if startup_enabled():
+            set_startup(True)
+    except Exception:
+        log.exception("install to %s failed; running from %s", INSTALL_DIR, exe)
+        release_single_instance()
+        return False
+    log.info("installed to %s", INSTALLED_EXE)
+    release_single_instance()
+    updater.launch(INSTALLED_EXE, ["--after-install"] + [a for a in sys.argv[1:] if a.startswith("--")])
+    return True
+
+
+def uninstall(app=None, quiet=None):
+    """Remove the Startup shortcut, the Apps entry, optionally the settings, and the program file itself.
+    Runs either inside the running app (tray menu) or as a separate process (--uninstall)."""
+    if quiet is None:
+        quiet = "--quiet" in sys.argv
+    wipe_settings = True
+    if not quiet:
+        try:
+            from welcome import show_task_dialog
+            result = show_task_dialog(f"{NAME_HE} · {NAME_EN}", f"להסיר את {NAME_HE} מהמחשב?",
+                                      "התוכנה תיסגר, ההפעלה האוטומטית תבוטל והקובץ יימחק.",
+                                      [(1, "הסר"), (2, "ביטול")], verify_text="מחק גם את ההגדרות והיומן",
+                                      verify_checked=True)
+        except Exception:
+            log.exception("uninstall dialog")
+            result = None
+        if result is None:
+            r = W.user32.MessageBoxW(None, f"להסיר את {NAME_HE} מהמחשב?", f"{NAME_HE} · {NAME_EN}", 0x34 | 0x100000)
+            result = (1 if r == 6 else 2, True)
+        if result[0] != 1:
+            return False
+        wipe_settings = result[1]
+    log.info("uninstalling (settings %s)", "removed" if wipe_settings else "kept")
+    exes = {os.path.abspath(sys.executable)} if is_frozen() else set()
+    if os.path.exists(INSTALLED_EXE):
+        exes.add(os.path.abspath(INSTALLED_EXE))
+    if app is not None:
+        app.shutdown()
+    else:
+        stop_other_instances()
+    release_single_instance()
+    set_startup(False)
+    unregister_uninstall()
+    if wipe_settings:
+        import shutil
+        logging.shutdown()
+        shutil.rmtree(APP_DIR, ignore_errors=True)
+    if exes:
+        # the exe stays locked until the PyInstaller bootloader has cleaned up, so a small batch file
+        # keeps trying for up to ~40 s, then removes itself
+        import subprocess
+        import tempfile
+        lines = ["@echo off", "ping 127.0.0.1 -n 3 >nul"]
+        for e in exes:
+            lines.append(f'for /L %%i in (1,1,20) do (if exist "{e}" (del /f /q "{e}" >nul 2>&1 & ping 127.0.0.1 -n 3 >nul))')
+            lines.append(f'del /f /q "{e}.old" >nul 2>&1')
+        lines += [f'rmdir "{INSTALL_DIR}" >nul 2>&1', 'del "%~f0"']
+        bat = os.path.join(tempfile.gettempdir(), f"{APP_NAME}-remove.bat")
+        with open(bat, "w", encoding="ascii", errors="replace") as f:
+            f.write("\r\n".join(lines) + "\r\n")
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000 | 0x00000008, close_fds=True)
+    if not quiet:
+        W.user32.MessageBoxW(None, f"{NAME_HE} הוסרה מהמחשב.", f"{NAME_HE} · {NAME_EN}", 0x40 | 0x100000)
+    os._exit(0)
 
 
 _mutex = None
@@ -859,14 +1130,24 @@ def main():
     if "--welcome-test" in sys.argv:
         show_welcome(AutoLanguage(), auto_close_ms=2500)
         return
+    if "--uninstall" in sys.argv:
+        uninstall()
+        return
+    if install_self():
+        return
     for arg in sys.argv:
         if arg.startswith("--pretend-version="):  # testing aid for the updater
             VERSION = arg.split("=", 1)[1]
-    if not single_instance(wait_seconds=15 if "--after-update" in sys.argv else 0):
+    if not single_instance(wait_seconds=15 if ("--after-update" in sys.argv or "--after-install" in sys.argv) else 0):
         log.info("already running")
         return
-    log.info("Safa Brura %s starting", VERSION)
-    if "--after-update" in sys.argv:
+    log.info("Safa Brura %s starting from %s", VERSION, sys.executable)
+    if is_frozen():
+        try:
+            register_uninstall(sys.executable)
+        except Exception:
+            log.exception("register uninstall")
+    if "--after-update" in sys.argv or "--after-install" in sys.argv:
         import updater
         threading.Thread(target=updater.cleanup_old, daemon=True).start()
     app = AutoLanguage()

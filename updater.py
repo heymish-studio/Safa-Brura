@@ -95,13 +95,18 @@ def install(info, progress=None):
     except OSError:
         os.replace(old, exe)      # put the original back
         raise
+    launch(exe, ["--after-update"] + [a for a in sys.argv[1:] if a == "--no-hooks"])
+
+
+def launch(exe, args):
+    """Start another copy of the program, detached, with a clean PyInstaller environment (a child that
+    inherits the parent's temp folder loses its data files when the parent exits)."""
     env = dict(os.environ)
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     for k in list(env):
         if k.startswith("_PYI") or k.startswith("_MEI"):
             del env[k]
-    args = [exe, "--after-update"] + [a for a in sys.argv[1:] if a == "--no-hooks"]
-    subprocess.Popen(args, cwd=folder, env=env, close_fds=True,
+    subprocess.Popen([exe] + list(args), cwd=os.path.dirname(exe), env=env, close_fds=True,
                      creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 
 

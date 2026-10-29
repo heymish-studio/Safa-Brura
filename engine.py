@@ -17,6 +17,12 @@ import winapi as W
 
 HEBREW_FINALS = "ךםןףץ"
 HEBREW_APOSTROPHE_AFTER = "גזצתד"
+# Hebrew clitic prefixes (and, the, that, in, to, as, from, when...) and English suffixes: a word
+# that is a listed word plus one of these is treated as a real word even when the spell checker is
+# missing or not trusted. Only makes the engine MORE careful (fewer automatic fixes).
+HEBREW_PREFIXES = ("ו", "ה", "ש", "ב", "ל", "כ", "מ", "וה", "וש", "וב", "ול", "וכ", "ומ", "שה", "כש", "שב",
+                   "של", "שכ", "שמ", "בה", "לה", "מה", "וכש", "לכש", "ושה", "ושב", "ושל", "ומה", "ובה")
+ENGLISH_SUFFIXES = ("s", "es", "ed", "d", "ing", "er", "ers", "ly", "n't", "'s", "'re", "'ve", "'ll", "'d", "'m")
 
 
 def resource_path(rel):
@@ -88,8 +94,9 @@ class Language:
                 return False
         return True
 
-    def plausible(self, word):
-        """Lenient: could a user have meant this word in this language?"""
+    def plausible(self, word, morph=False):
+        """Lenient: could a user have meant this word in this language?
+        morph=True also accepts a listed word carrying a common prefix (Hebrew) or suffix (English)."""
         if not self.well_formed(word):
             return False
         low = word.lower()
@@ -97,9 +104,21 @@ class Language:
             return True
         if len(word) >= self.spell_min_len and self.spell is not None:
             try:
-                return self.spell.is_word(word)
+                if self.spell.is_word(word):
+                    return True
             except Exception:
-                return False
+                pass
+        return morph and self.morph_plausible(low)
+
+    def morph_plausible(self, low):
+        if self.short == "he":
+            for p in HEBREW_PREFIXES:
+                if len(low) - len(p) >= 2 and low.startswith(p) and low[len(p):] in self.freq:
+                    return True
+        else:
+            for sfx in ENGLISH_SUFFIXES:
+                if len(low) - len(sfx) >= 2 and low.endswith(sfx) and low[:-len(sfx)] in self.freq:
+                    return True
         return False
 
     def confident(self, word):
@@ -159,7 +178,7 @@ class Engine:
             return None
         if source.lower() in self.ignore_words:
             return None
-        if cur.plausible(source):
+        if cur.plausible(source, morph=True):
             return None
         for lang in self.languages:
             if lang is cur:

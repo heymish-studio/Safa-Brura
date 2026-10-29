@@ -171,3 +171,61 @@ prefix_check("correct English sentence stays English", "I already found one and 
 prefix_check("'to ' before a Hebrew word is converted", "to ", EN, HE, True)
 
 print(f"\n{sum(results)}/{len(results)} passed")
+
+
+# --- ping-pong guard: a wrong fix is undone by the user's own typing and never repeated -----------
+def find_false_fix():
+    """A Hebrew string the engine wrongly 'fixes' to English (not plausible Hebrew, common English)."""
+    for word, count in sorted(EN.freq.items(), key=lambda kv: -kv[1]):
+        if count < 200 or len(word) < 3 or not word.isalpha():
+            continue
+        keys = []
+        for ch in word:
+            r = user32.VkKeyScanExW(ch, EN.hkl)
+            keys.append(autolang.KeyRec(r & 0xFF, user32.MapVirtualKeyExW(r & 0xFF, 0, EN.hkl), False, False, HE.id))
+        heb = HE.render(keys)
+        if HE.well_formed(heb) and not HE.plausible(heb, morph=True) and EN.confident(word):
+            return heb, word
+    return None, None
+
+
+heb, eng = find_false_fix()
+print(f"(false-fix sample: {heb!r} -> {eng!r})")
+app.cfg["ignore_words"] = []
+app.engine.ignore_words = set()
+
+reset(HE); type_keys(heb + " ", HE)
+check("the wrong fix happens first", eng + " ", EN)
+type_keys("אני רוצה ", HE)
+check("typing on restores the text and the layout", heb + " אני רוצה ", HE)
+ok = heb.lower() in app.engine.ignore_words
+results.append(ok); print(f"{'PASS' if ok else 'FAIL'} the wrong word is on the ignore list")
+
+reset(HE); type_keys(heb + " אני ", HE)
+check("the same word is never fixed again", heb + " אני ", HE)
+
+# a wrong fix whose text is out of reach (Enter was pressed): only the new word is fixed, no crash
+app.cfg["ignore_words"] = []; app.engine.ignore_words = set()
+reset(HE); type_keys(heb + " ", HE); press(W.VK_RETURN, 0x1C, "\n"); type_keys("אני רוצה ", HE)
+check("after Enter: the new words are fixed to Hebrew, the old line stays", eng + " \nאני רוצה ", HE)
+
+# a manual switch straight back rejects the fix
+app.cfg["ignore_words"] = []; app.engine.ignore_words = set()
+reset(HE); type_keys(heb + " ", HE)
+sim.layout = HE  # the user presses Alt+Shift
+type_keys("א", HE)
+ok = heb.lower() in app.engine.ignore_words
+results.append(ok); print(f"{'PASS' if ok else 'FAIL'} switching the layout back by hand teaches the word")
+
+# three wrong fixes in a row pause automatic fixing
+app.strikes = []; app.paused_until = 0
+app.notify = lambda m: print("   notify:", m)
+for _ in range(3):
+    app.strike()
+reset(EN); type_keys("שלום לכם ", HE)
+check("paused: nothing is fixed", "akuo kfo ", EN)
+app.paused_until = 0
+reset(EN); type_keys("שלום לכם ", HE)
+check("after the pause fixing works again", "שלום לכם ", HE)
+
+print(f"\n{sum(results)}/{len(results)} passed")
