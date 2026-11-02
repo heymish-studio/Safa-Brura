@@ -228,4 +228,36 @@ app.paused_until = 0
 reset(EN); type_keys("שלום לכם ", HE)
 check("after the pause fixing works again", "שלום לכם ", HE)
 
+
+# --- a new message in the other language is not a "reversal" (1.3.1) ----------------------------
+def guard_clean(name):
+    ok = not app.engine.ignore_words and not app.strikes
+    results.append(ok)
+    print(f"{'PASS' if ok else 'FAIL'} {name}: ignore={sorted(app.engine.ignore_words)} strikes={len(app.strikes)}")
+
+
+def fresh():
+    app.cfg["ignore_words"] = []
+    app.engine.ignore_words = set()
+    app.strikes = []
+    app.paused_until = 0
+
+
+fresh(); reset(EN); type_keys("שלום ", HE); press(W.VK_RETURN, 0x1C, "\n"); type_keys("hello ", EN)
+check("Hebrew message, Enter, English message: both fixed", "שלום \nhello ", EN)
+guard_clean("  ...and the Hebrew fix is not blamed")
+
+fresh(); reset(EN); type_keys("שלום ", HE); press(W.VK_RETURN, 0x1C, "\n")
+sim.layout = EN  # the user presses Alt+Shift to write the next message in English
+type_keys("hi ", EN)
+guard_clean("Enter, then switching the layout by hand does not reject the fix")
+
+fresh(); reset(EN); type_keys("שלום ", HE); app.reset("mouse"); type_keys("hello ", EN)
+check("click elsewhere, then English on the Hebrew layout: fixed", "שלום hello ", EN)
+guard_clean("  ...and the earlier fix is not blamed")
+
+fresh(); reset(EN); type_keys("שלום", HE)
+press(0xBF, user32.MapVirtualKeyExW(0xBF, 0, HE.hkl), "/")  # the key that is '.' on the Hebrew layout
+check("Hebrew word ended by the Hebrew period key", "שלום.", HE)
+
 print(f"\n{sum(results)}/{len(results)} passed")

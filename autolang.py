@@ -27,7 +27,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "log.txt")
 REPLAY_TAG = 0xA7101A97
 GITHUB_URL = "https://github.com/heymish-studio/Safa-Brura"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 ACCEPT_INJECTED = "--accept-injected" in sys.argv  # testing only: treat synthetic input as typed
 INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA", APP_DIR), "Programs", APP_NAME)
 INSTALLED_EXE = os.path.join(INSTALL_DIR, f"{APP_NAME}.exe")
@@ -200,6 +200,10 @@ class AutoLanguage:
         self.word_start = 0
         self.skip_until_reset = False
         self.last_fix = None
+        # The ping-pong guard only judges a fix by what the user types right after it, in the same text.
+        # After Enter, a click or a window change the next words are a new message, often legitimately in
+        # the other language, and must not count against the earlier fix.
+        self.recent_fix = None
         self.buffer_gen += 1
 
     def _keyboard_proc(self, code, wparam, lparam):
@@ -581,8 +585,7 @@ class AutoLanguage:
 
     def _after_boundary(self, bvk, brec, lang):
         if bvk in LINE_VKS:
-            self.keys = []
-            self.word_start = 0
+            self.reset("line")  # same as an Enter/Tab typed without a fix: the text so far is done
             return
         brec.layout = lang.id
         self.keys.append(brec)
