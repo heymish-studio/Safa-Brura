@@ -19,7 +19,7 @@ autolang, engine, macapi, keymap = bootstrap.install()
 W, K = macapi, keymap
 log = autolang.log
 
-MAC_VERSION = "0.1.0"
+MAC_VERSION = "0.2.0"
 NAME = "שפה ברורה · Safa Brura"
 REPO = "heymish-studio/Safa-Brura"
 MAC_ASSET = "SafaBrura-mac.zip"
